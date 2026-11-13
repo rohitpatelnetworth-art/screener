@@ -7,8 +7,7 @@ Like TradingView: choose the bar timeframe (15m / Daily / Weekly / Monthly / Qua
 Beta-Alpha period (number of bars) separately, and set the risk-free rate in the page.
 Symbols: official Nifty 200 list (cached as nifty200.csv) or your own custom_symbols.txt.
 """
-import concurrent.futures as cf
-import io, json, os, pathlib, re, sys, time, webbrowser
+import json, os, pathlib, re, sys, webbrowser
 from datetime import date
 import pandas as pd, requests, yfinance as yf
 
@@ -51,136 +50,6 @@ def get(raw, t, min_len):
 
 def arr(s):
     return [None if pd.isna(v) else round(float(v), 2) for v in s]
-
-
-FUND = HERE / "fundamentals.json"
-
-
-def fetch_fund(sym):
-    """Annual + quarterly EPS and sector from Yahoo (Yahoo keeps only ~4 years annual, ~5 quarters)."""
-    def row(df):
-        for k in ("Diluted EPS", "Basic EPS"):
-            if df is not None and not df.empty and k in df.index:
-                return {str(i)[:10]: float(v) for i, v in df.loc[k].dropna().items()}
-        return {}
-    for _ in range(2):
-        try:
-            t = yf.Ticker(sym + ".NS")
-            try:
-                sector = t.info.get("sector")
-            except Exception:
-                sector = None
-            return {"sector": sector, "a": row(t.income_stmt), "q": row(t.quarterly_income_stmt)}
-        except Exception:
-            continue
-    return {"sector": None, "a": {}, "q": {}}
-
-
-def load_fund(syms):
-    cache = {}
-    if FUND.exists():
-        try:
-            cache = json.loads(FUND.read_text())
-        except Exception:
-            cache = {}
-    fresh = lambda d: bool(d) and (date.today() - date.fromisoformat(d["on"])).days < 7
-    todo = [s for s in syms if not fresh(cache.get(s))]
-    if todo:
-        print(f"Fetching EPS and sector for {len(todo)} stocks (first run takes several minutes, then cached)...")
-        with cf.ThreadPoolExecutor(4) as ex:
-            for s, d in zip(todo, ex.map(fetch_fund, todo)):
-                if d["a"] or d["q"]:
-                    d["on"] = date.today().isoformat()
-                    cache[s] = d
-        FUND.write_text(json.dumps(cache))
-    return cache
-
-
-def ttm_points(fd):
-    """TTM EPS as a step series dated when results were public (annual +60 days, quarterly +45 days)."""
-    if not fd:
-        return None
-    pts = {pd.Timestamp(d) + pd.Timedelta(days=60): v for d, v in fd.get("a", {}).items()}
-    q = sorted(fd.get("q", {}).items())
-    for k in range(3, len(q)):
-        pts[pd.Timestamp(q[k][0]) + pd.Timedelta(days=45)] = sum(v for _, v in q[k - 3:k + 1])
-    return pd.Series(pts).sort_index() if pts else None
-
-
-# ---- official sector index PE (niftyindices.com) ----
-SECTOR_IDX = [  # (index name in the PE report, constituents CSV); most specific first
-    ("NIFTY PSU BANK", "ind_niftypsubanklist"), ("NIFTY PRIVATE BANK", "ind_niftyprivatebanklist"),
-    ("NIFTY BANK", "ind_niftybanklist"), ("NIFTY IT", "ind_niftyitlist"), ("NIFTY AUTO", "ind_niftyautolist"),
-    ("NIFTY FMCG", "ind_niftyfmcglist"), ("NIFTY PHARMA", "ind_niftypharmalist"),
-    ("NIFTY HEALTHCARE INDEX", "ind_niftyhealthcarelist"), ("NIFTY METAL", "ind_niftymetallist"),
-    ("NIFTY ENERGY", "ind_niftyenergylist"), ("NIFTY OIL & GAS", "ind_niftyoilgaslist"),
-    ("NIFTY REALTY", "ind_niftyrealtylist"), ("NIFTY MEDIA", "ind_niftymedialist"),
-    ("NIFTY CONSUMER DURABLES", "ind_niftyconsumerdurableslist"),
-    ("NIFTY FINANCIAL SERVICES", "ind_niftyfinancelist")]
-PE_URL = "https://niftyindices.com/Backpage.aspx/getpepbHistoricaldataDBtoString"
-NI_HDR = {"User-Agent": "Mozilla/5.0", "Referer": "https://niftyindices.com/reports/historical-data",
-          "Content-Type": "application/json; charset=UTF-8", "X-Requested-With": "XMLHttpRequest",
-          "Accept": "application/json, text/javascript, */*; q=0.01"}
-SPE = HERE / "sector_pe.json"
-
-
-def fetch_index_pe(name, start, end):
-    out, s = {}, pd.Timestamp(start)
-    while s <= pd.Timestamp(end):
-        e = min(s + pd.Timedelta(days=364), pd.Timestamp(end))
-        sd, ed = s.strftime("%d-%b-%Y"), e.strftime("%d-%b-%Y")
-        body = {"cinfo": f"{{'name':'{name}','startDate':'{sd}','endDate':'{ed}','indexName':'{name}'}}"}
-        r = requests.post(PE_URL, headers=NI_HDR, json=body, timeout=30)
-        r.raise_for_status()
-        for x in json.loads(r.json()["d"]):
-            k = {str(a).lower().replace(" ", "").replace("/", ""): v for a, v in x.items()}
-            d = pd.to_datetime(k.get("date"), dayfirst=True, errors="coerce")
-            try:
-                v = float(str(k.get("pe")).replace(",", ""))
-            except ValueError:
-                continue
-            if pd.notna(d):
-                out[d] = v
-        s = e + pd.Timedelta(days=1)
-        time.sleep(0.4)
-    return pd.Series(out).sort_index()
-
-
-def official_sector_pe(dates, syms):
-    """Returns ({stock: sector index name}, {index name: PE series on `dates`}). Empty if unavailable."""
-    today = date.today().isoformat()
-    cache = {}
-    if SPE.exists():
-        try:
-            cache = json.loads(SPE.read_text())
-        except Exception:
-            cache = {}
-    if cache.get("on") != today:
-        cache = {"on": today, "members": {}, "pe": {}}
-        print("Fetching official sector index PE from niftyindices.com (a few minutes)...")
-        for name, f in SECTOR_IDX:
-            try:
-                r = requests.get(f"https://niftyindices.com/IndexConstituent/{f}.csv", headers=NI_HDR, timeout=25)
-                r.raise_for_status()
-                cache["members"][name] = pd.read_csv(io.BytesIO(r.content))["Symbol"].astype(str).str.strip().tolist()
-                ser = fetch_index_pe(name, dates[0], dates[-1])
-                if len(ser):
-                    cache["pe"][name] = {k.strftime("%Y-%m-%d"): v for k, v in ser.items()}
-            except Exception as e:
-                print(f"  {name}: skipped ({str(e)[:70]})")
-        if cache["pe"]:
-            SPE.write_text(json.dumps(cache))
-    mp, ser = {}, {}
-    for name, _ in SECTOR_IDX:
-        pe = cache["pe"].get(name)
-        if not pe:
-            continue
-        s = pd.Series({pd.Timestamp(k): v for k, v in pe.items()}).sort_index()
-        ser[name] = s.reindex(s.index.union(dates)).ffill(limit=5).reindex(dates)
-        for sym in cache["members"].get(name, []):
-            mp.setdefault(sym, name)
-    print(f"Official sector PE loaded for {len(ser)} of {len(SECTOR_IDX)} sector indices; others use median PE.")
-    return mp, ser
 
 
 def close_bars(s, tf):
@@ -243,31 +112,9 @@ def main():
                     continue
             b[tf] = arr(close_bars(src["Close"], tf).reindex(ib[tf].index).ffill())
         stocks[sym] = {"c": arr(df["Close"].reindex(dates).ffill()), "h": arr(df["High"].reindex(dates)), "b": b}
-    fund = load_fund(list(stocks))
-    eps = {}
-    for s in stocks:
-        p = ttm_points(fund.get(s))
-        if p is not None:
-            e = p.reindex(p.index.union(dates)).ffill().reindex(dates)
-            eps[s] = e.where(e > 0)
-    secpe_out = {}
-    if eps:
-        epsdf = pd.DataFrame(eps)
-        closes = pd.DataFrame({s: pd.Series(stocks[s]["c"], index=dates, dtype=float) for s in epsdf.columns})
-        pe = (closes / epsdf).where(lambda x: x < 200)
-        secs = {s: fund[s].get("sector") or "Unknown" for s in epsdf.columns}
-        for sec in set(secs.values()):
-            sub = pe[[s for s in epsdf.columns if secs[s] == sec]]
-            secpe_out[sec] = arr(sub.median(axis=1).where(sub.notna().sum(axis=1) >= 3))
-        off_map, off_pe = official_sector_pe(dates, list(stocks))
-        for s in epsdf.columns:
-            stocks[s]["e"] = arr(epsdf[s])
-            stocks[s]["sec"] = off_map[s] if s in off_map else secs[s]
-        for nm in {stocks[s]["sec"] for s in epsdf.columns} & set(off_pe):
-            secpe_out[nm] = arr(off_pe[nm])
-    data = {"dates": list(dates.strftime("%Y-%m-%d")), "secpe": secpe_out, "tfl": {k: TFL[k] for k in ib},
+    data = {"dates": list(dates.strftime("%Y-%m-%d")), "tfl": {k: TFL[k] for k in ib},
             "ppy": PPY, "tf": tfd, "ix": arr(idx["Close"].reindex(dates).ffill()), "stocks": stocks}
-    meta = (f"Generated {date.today():%d %b %Y} | last daily price {data['dates'][-1]} | {len(stocks)} stocks | EPS lines for {len(eps)}"
+    meta = (f"Generated {date.today():%d %b %Y} | last daily price {data['dates'][-1]} | {len(stocks)} stocks"
             + (f" | skipped: {', '.join(skipped)}" if skipped else ""))
     OUT.parent.mkdir(exist_ok=True)
     OUT.write_text(TEMPLATE.replace("__DATA__", json.dumps(data, separators=(",", ":")))
@@ -316,7 +163,6 @@ tr.sel{background:#c98a1233}.up{color:var(--g);font-weight:600}.dn{color:var(--r
 <div><label>Alpha from</label><input id="af" type="number" step="0.1" value="1"></div>
 <div><label>Alpha to</label><input id="at" type="number" step="0.1" value="100"></div>
 <div><label>Signals within</label><select id="rec"><option value="0">All bars stored</option><option value="1">Today / last day</option><option value="5">Last 5 days</option><option value="21">Last 1 month</option><option value="63">Last 3 months</option><option value="126">Last 6 months</option><option value="252">Last 1 year</option></select></div>
-<div><label>Fair P/E multiple (EPS line)</label><input id="pm" type="number" step="1" value="25"></div>
 <div><label><input type="checkbox" id="auto" checked style="width:auto"> Auto-apply best setup when timeframe changes</label></div>
 <div><label>Search symbol</label><input id="q" placeholder="e.g. JIOFIN"></div></div></div>
 <p class="m" id="why"></p>
@@ -325,7 +171,6 @@ tr.sel{background:#c98a1233}.up{color:var(--g);font-weight:600}.dn{color:var(--r
 <div class="c tw"><table><thead><tr><th data-k="sym">Symbol</th><th data-k="date">Latest signal</th><th data-k="beta">β</th><th data-k="alpha">α</th><th data-k="price">Price at signal</th><th data-k="now">Current</th><th data-k="chg">Change</th><th data-k="n">Signals</th></tr></thead><tbody id="tb"></tbody></table></div>
 <div id="dt"></div>
 <p class="m">__META__</p>
-<p class="m">EPS lines: TTM EPS is built from Yahoo annual and quarterly EPS (results counted 60 / 45 days after period end, so no look-ahead) and changes step by step; Yahoo keeps only about 4 years of annual and 5 quarters of quarterly data, so older bars may have no EPS line. Sector PE: the official NSE sector index PE from niftyindices.com where the stock belongs to a sector index (its name is on the card); otherwise the median PE (close / TTM EPS, PE below 200) of Nifty 200 stocks in the same Yahoo sector, needing at least 3 stocks. NSE publishes no index PE on days when the index total earnings are negative, so such gaps are filled forward for up to 5 days.</p>
 <p class="m">Risk-free yield: type the current value of the TradingView symbol you use (e.g. TVC:IN03MY) for the selected tenor; the page remembers it per tenor. The indicator reads the yield bar by bar, this page uses one value for all bars, so old signals can differ slightly. In "Same as Pine" mode the yield is subtracted as a raw number (e.g. 5.75) from fractional returns, so alpha is roughly yield x (beta - 1) and changing the yield changes every alpha, which matches what you see in TradingView. 15-minute data from Yahoo covers only the last ~60 days. 3M/6M/1Y results use 63/126/252 trading days after the signal day.</p>
 </div><script>
 const D=__DATA__,$=id=>document.getElementById(id);
@@ -385,23 +230,18 @@ function open(r,k,ns){
  k=k??r.sig.length-1;OS={r,k};const sg=r.sig[k],pos=sg.p,T=D.tf[r.tf],s=D.stocks[r.sym],b=sg.price,a=analyse(s,pos,b);
  const opts=r.sig.map((x,j)=>`<option value="${j}"${j==k?" selected":""}>${T.t[x.i]} (β ${x.beta}, α ${x.alpha})</option>`).reverse().join("");
  const card=(t,v,p,n)=>`<div class="k"><span class="m">${t}</span><b>${fmt(v)}</b><span class="${cl(p)}">${ps(p)}</span><div class="m">${n}</div></div>`;
- const pm=+$("pm").value||25,N=D.dates.length-1,eN=s.e?s.e[N]:null,sp=s.e?D.secpe[s.sec]:null,spN=sp?sp[N]:null;
- const la=eN!=null?eN*pm:null,lb=eN!=null&&spN!=null?eN*spN:null;
- const fl=s.e?card("TTM EPS × "+pm,la,pc(la,a.now),"vs current price; TTM EPS "+fmt(eN))+card("TTM EPS × sector PE",lb,pc(lb,a.now),"vs current price; "+esc(s.sec)+" PE "+fmt(spN)):`<div class="k m">No EPS data for this stock, so the EPS lines are not drawn.</div>`;
  $("dt").innerHTML=`<div class="c"><div class="f" style="grid-template-columns:200px 1fr;align-items:end"><h3>${esc(r.sym)}</h3><div style="max-width:360px"><label>Signal date (all signals in your filter)</label><select id="sg">${opts}</select></div></div>
  <p class="m">${a.days} trading days since the signal (${T.t[sg.i]}). Percentages are versus the price at the signal.</p>
  <div class="g">${card("Price at signal",b,null,T.t[sg.i])}
  ${card("3-month result",a.c3,pc(a.c3,b),a.e3?"close 63 trading days later":"not complete, latest close used")}
  ${card("6-month max high",a.h6,pc(a.h6,b),a.e6?"highest high in 6 months":"window incomplete, so far")}
  ${card("1-year max high",a.h1,pc(a.h1,b),a.e1?"highest high in 1 year":"window incomplete, so far")}
- ${card("Current price",a.now,pc(a.now,b),D.dates[D.dates.length-1])}${fl}</div><div id="ch" style="height:420px;margin-top:10px"></div></div>`;
+ ${card("Current price",a.now,pc(a.now,b),D.dates[D.dates.length-1])}</div><div id="ch" style="height:420px;margin-top:10px"></div></div>`;
  $("sg").onchange=e=>open(r,+e.target.value);
  const xs=D.dates.slice(pos),later=r.sig.filter(x=>x.p>=pos);
- const ln=s.e?[{x:xs,y:s.e.slice(pos).map(v=>v==null?null:v*pm),mode:"lines",name:"TTM EPS × "+pm,line:{color:"#2b6cb0",dash:"dash",shape:"hv"}},
-  {x:xs,y:s.e.slice(pos).map((v,j)=>{const q=sp&&sp[pos+j];return v==null||q==null?null:v*q}),mode:"lines",name:"TTM EPS × sector PE",line:{color:"#8e44ad",dash:"dot"}}]:[];
  Plotly.newPlot("ch",[{x:xs,y:s.c.slice(pos),mode:"lines",name:"Close",line:{color:"#1f7a55"}},
   {x:xs,y:s.h.slice(pos),mode:"lines",name:"Daily high",line:{color:"#c98a12",width:1}},
-  {x:later.map(x=>D.dates[x.p]),y:later.map(x=>x.price),mode:"markers",name:"Signals",marker:{size:9,color:"#b3402e",symbol:"triangle-up"}}].concat(ln),
+  {x:later.map(x=>D.dates[x.p]),y:later.map(x=>x.price),mode:"markers",name:"Signals",marker:{size:9,color:"#b3402e",symbol:"triangle-up"}}],
   {title:r.sym+": "+D.dates[pos]+" to "+D.dates[D.dates.length-1],margin:{t:40,l:55,r:10,b:35},legend:{orientation:"h"},
   shapes:[{type:"line",xref:"paper",x0:0,x1:1,y0:b,y1:b,line:{dash:"dot",color:"#5d6b66"}}]},{responsive:true});
  if(!ns)$("dt").scrollIntoView({behavior:"smooth"});
@@ -417,7 +257,6 @@ function apply(){const tf=$("tf").value,p=PS[tf]||PS.W,pine=$("am").value=="pine
 ["n","rt","bf","bt","af","at","rec","q"].forEach(i=>$(i).oninput=draw);
 ["tf","am"].forEach(i=>$(i).oninput=()=>$("auto").checked?apply():draw());
 $("rf").oninput=()=>{RF[$("ten").value]=+$("rf").value;try{localStorage.rf=JSON.stringify(RF)}catch(e){}draw()};
-$("pm").oninput=()=>{if(OS)open(OS.r,OS.k,true)};
 $("ten").onchange=()=>{const v=RF[$("ten").value];if(v!=null)$("rf").value=v;$("rfh").textContent=v==null?"(enter this tenor's yield from TradingView)":"";draw()};
 document.querySelectorAll("th").forEach(h=>h.onclick=()=>{const k=h.dataset.k;sd=sk==k?-sd:-1;sk=k;draw()});
 $("tb").onclick=e=>{const tr=e.target.closest("tr");if(!tr)return;document.querySelectorAll("tr.sel").forEach(x=>x.classList.remove("sel"));tr.classList.add("sel");open(rows[+tr.dataset.i])};
