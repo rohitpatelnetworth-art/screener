@@ -1,0 +1,14 @@
+{
+  "name": "Beta / Alpha Screener",
+  "short_name": "αβ Screener",
+  "description": "Nifty 200 Beta-Alpha screener, updated daily. Educational only.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f6f4ee",
+  "theme_color": "#1f7a55",
+  "icons": [
+    {"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}
